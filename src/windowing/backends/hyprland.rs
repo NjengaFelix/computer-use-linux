@@ -287,12 +287,20 @@ pub struct WindowCapture {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// True when the window was on a hidden workspace and was captured twice.
-    /// Hyprland stops sending frame callbacks to off-screen windows, so their
-    /// buffer holds the last frame drawn while visible. A capture makes the
-    /// compositor send one, the client repaints, and the second capture holds
-    /// the current frame.
-    pub repainted: bool,
+    /// Set when the window was on a hidden workspace. Hyprland stops sending
+    /// frame callbacks to off-screen windows, so their buffer holds the last
+    /// frame drawn while visible. Each capture makes the compositor send one
+    /// and the client repaints; some clients (Chromium) need several rounds.
+    pub hidden_workspace: Option<HiddenWorkspaceCapture>,
+}
+
+pub struct HiddenWorkspaceCapture {
+    pub workspace: i64,
+    /// Captures taken before two consecutive frames matched or the cap hit.
+    pub captures: u32,
+    /// False when frames were still changing at the cap: an animation, a
+    /// blinking caret, or a page that is still loading.
+    pub settled: bool,
 }
 
 /// Captures a window through `grim -T <stableId>` (ext-foreign-toplevel
@@ -330,19 +338,41 @@ pub async fn capture_window(window_id: u64) -> Result<WindowCapture> {
         _ => None,
     };
 
-    let repainted = workspace_visible == Some(false);
-    if repainted {
-        grim_toplevel(&stable_id, &address).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
-    let png = grim_toplevel(&stable_id, &address).await?;
+    const MAX_CAPTURES: u32 = 8;
+    const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut png = grim_toplevel(&stable_id, &address).await?;
+    let hidden_workspace = match (workspace_visible, workspace_id) {
+        (Some(false), Some(workspace)) => {
+            // Capture until two consecutive frames match: the first capture
+            // only wakes the client, and Chromium takes several rounds.
+            let mut captures = 1;
+            let mut settled = false;
+            while captures < MAX_CAPTURES {
+                tokio::time::sleep(SETTLE_INTERVAL).await;
+                let next = grim_toplevel(&stable_id, &address).await?;
+                captures += 1;
+                let same = next == png;
+                png = next;
+                if same && captures > 2 {
+                    settled = true;
+                    break;
+                }
+            }
+            Some(HiddenWorkspaceCapture {
+                workspace,
+                captures,
+                settled,
+            })
+        }
+        _ => None,
+    };
     let (width, height) = crate::screenshot_impl::png_dimensions(&png)
         .context("grim -T did not return a usable PNG image")?;
     Ok(WindowCapture {
         png,
         width,
         height,
-        repainted,
+        hidden_workspace,
     })
 }
 

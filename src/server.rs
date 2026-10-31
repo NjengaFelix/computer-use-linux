@@ -5282,7 +5282,7 @@ impl ComputerUseLinux {
     /// unfocused Hyprland window, capture just that window with `grim -T`
     /// instead of raising it or grabbing the desktop through the portal.
     /// Returns `None` to fall through to the regular capture path. The note
-    /// explains the repaint capture used for windows on hidden workspaces.
+    /// explains the repeated capture used for windows on hidden workspaces.
     async fn hyprland_background_capture(
         &self,
         window: &WindowInfo,
@@ -5297,22 +5297,29 @@ impl ComputerUseLinux {
             async {
                 let capture =
                     crate::windowing::backends::hyprland::capture_window(window.window_id).await?;
-                let note = capture.repainted.then(|| {
+                let note = capture.hidden_workspace.as_ref().map(|hidden| {
+                    let state = if hidden.settled {
+                        "the last two frames matched, so the image is current"
+                    } else {
+                        "frames were still changing (animation, caret or loading), so details may lag"
+                    };
                     format!(
-                        "Window_id {} is on hidden workspace {}, which Hyprland does not repaint. It was captured twice so the window drew a current frame; animations or slow loads may still lag the accessibility tree, which stays authoritative.",
-                        window.window_id,
-                        window.workspace.map_or("?".to_string(), |id| id.to_string())
+                        "Window_id {} is on hidden workspace {}, which Hyprland does not repaint; it was captured {} times so the window drew current frames, and {state}. The accessibility tree stays authoritative.",
+                        window.window_id, hidden.workspace, hidden.captures
                     )
                 });
+                let source = match &capture.hidden_workspace {
+                    Some(hidden) if hidden.settled => {
+                        "hyprland-grim-toplevel (hidden workspace, settled)"
+                    }
+                    Some(_) => "hyprland-grim-toplevel (hidden workspace, still changing)",
+                    None => "hyprland-grim-toplevel",
+                };
                 Ok((
                     RawScreenshotCapture {
                         mime_type: "image/png".to_string(),
                         bytes: capture.png,
-                        source: if capture.repainted {
-                            "hyprland-grim-toplevel (hidden workspace, repainted)".to_string()
-                        } else {
-                            "hyprland-grim-toplevel".to_string()
-                        },
+                        source: source.to_string(),
                         width: capture.width,
                         height: capture.height,
                     },
