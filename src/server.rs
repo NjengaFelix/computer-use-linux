@@ -2185,6 +2185,21 @@ impl ComputerUseLinux {
     async fn dispatch_press_key(&self, params: PressKeyParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        if let Some(output) = self
+            .hyprland_background_input(
+                "press_key",
+                &params.window_target(),
+                crate::hyprland_input::chord_to_key_press(&params.key)
+                    .map(|press| vec![press])
+                    .ok_or_else(|| {
+                        "Unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Super, Ctrl+L, or a single US keyboard letter/digit.".to_string()
+                    }),
+                received.clone(),
+            )
+            .await
+        {
+            return Json(output);
+        }
         let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
             Err(message) => {
@@ -2398,6 +2413,17 @@ impl ComputerUseLinux {
         }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let window_target = params.window_target();
+        if let Some(output) = self
+            .hyprland_background_input(
+                "type_text",
+                &window_target,
+                crate::hyprland_input::text_to_key_presses(&params.text),
+                received.clone(),
+            )
+            .await
+        {
+            return Json(output);
+        }
         let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
             Err(message) => {
@@ -5171,6 +5197,70 @@ impl ComputerUseLinux {
             return Some(UNMATCHABLE_ACCESSIBILITY_APP_FILTER.to_string());
         }
         candidates.into_iter().next()
+    }
+
+    /// Hyprland background input: when opted in with
+    /// `COMPUTER_USE_LINUX_HYPRLAND_BACKGROUND_INPUT=1` and the call names a
+    /// target window, keys go to that window through `send_key_state` without
+    /// focusing it, so the user's focus, cursor and workspace stay put.
+    /// Returns `None` to fall through to the focus-then-type path.
+    async fn hyprland_background_input(
+        &self,
+        action: &str,
+        target: &WindowTarget,
+        presses: std::result::Result<Vec<crate::hyprland_input::KeyPress>, String>,
+        received: Option<serde_json::Value>,
+    ) -> Option<ActionOutput> {
+        if !crate::hyprland_input::background_input_enabled()
+            || !target.has_target()
+            || !env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| {
+                desktop
+                    .split(':')
+                    .any(|part| part.eq_ignore_ascii_case("hyprland"))
+            })
+        {
+            return None;
+        }
+        let fail = |message: String| Some(action_result(action, Err(message), received.clone()));
+        let presses = match presses {
+            Ok(presses) => presses,
+            Err(message) => return fail(message),
+        };
+        let windows = match list_windows().await {
+            Ok(windows) => windows,
+            Err(error) => return fail(format!("Did not send input: {error:#}")),
+        };
+        let window = match resolve_window_target(&windows, target) {
+            Ok(window) => window.clone(),
+            Err(error) => return fail(format!("Did not send input: {error:#}")),
+        };
+        if window.backend != registry::HYPRLAND_BACKEND {
+            return None;
+        }
+        match crate::windowing::backends::hyprland::devices_json().await {
+            Ok(json) if crate::hyprland_input::keymap_is_us(&json) => {}
+            Ok(_) => {
+                return fail(
+                    "Did not send input: Hyprland background input maps keys for a US layout, and the active keymap is not US.".to_string(),
+                )
+            }
+            Err(error) => return fail(format!("Did not send input: {error:#}")),
+        }
+        let result =
+            crate::windowing::backends::hyprland::send_key_events(window.window_id, &presses).await;
+        Some(match result {
+            Ok(()) => successful_action_with_focus(
+                action,
+                &format!(
+                    "Action sent through Hyprland send_key_state to window_id {} ({} key presses) without focusing it; focus, cursor and workspace were not changed.",
+                    window.window_id,
+                    presses.len()
+                ),
+                received,
+                None,
+            ),
+            Err(error) => action_result(action, Err(format!("{error:#}")), received),
+        })
     }
 
     async fn focus_target_for_input(

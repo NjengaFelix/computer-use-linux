@@ -242,6 +242,57 @@ pub async fn activate_window(window_id: u64) -> Result<()> {
     }
 }
 
+/// Sends key presses to a window without focusing it, through Hyprland's
+/// `send_key_state` dispatcher. Every press is a down and an up event; all
+/// events go in one `hyprctl --batch` request per chunk.
+pub async fn send_key_events(
+    window_id: u64,
+    presses: &[crate::hyprland_input::KeyPress],
+) -> Result<()> {
+    const PRESSES_PER_BATCH: usize = 64;
+    let address = format!("address:0x{window_id:x}");
+    for chunk in presses.chunks(PRESSES_PER_BATCH) {
+        let batch = chunk
+            .iter()
+            .flat_map(|press| {
+                ["down", "up"].map(|state| {
+                    format!(
+                        "dispatch hl.dsp.send_key_state({{ mods = \"{}\", key = \"{}\", state = \"{state}\", window = \"{address}\" }})",
+                        press.mods, press.key
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        let output = hyprctl_output_async(&["--batch", &batch])
+            .await
+            .context("failed to run hyprctl --batch for send_key_state")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let replies = stdout.split_whitespace().collect::<Vec<_>>();
+        if !output.status.success()
+            || replies.len() != chunk.len() * 2
+            || replies.iter().any(|reply| *reply != "ok")
+        {
+            bail!(
+                "Hyprland send_key_state failed for {address}: {}",
+                command_detail(&output)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Raw `hyprctl devices -j` output, used to check the active keymap.
+pub async fn devices_json() -> Result<Vec<u8>> {
+    let output = hyprctl_output_async(&["devices", "-j"])
+        .await
+        .context("failed to run hyprctl devices -j")?;
+    if !output.status.success() {
+        bail!("hyprctl devices -j failed: {}", command_detail(&output));
+    }
+    Ok(output.stdout)
+}
+
 fn dispatch_succeeded(output: &std::process::Output) -> bool {
     output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "ok"
 }
