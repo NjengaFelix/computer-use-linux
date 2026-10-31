@@ -521,9 +521,28 @@ impl ComputerUseLinux {
             .resolve_accessibility_app_filter(&params, window_context.as_ref(), window_enumerated)
             .await;
         let mut screenshot_captured = None;
+        let mut capture_note = None;
         let (screenshot, screenshot_error) = if include_screenshot {
             let result: Result<ScreenshotCapture> = async {
                 let _pipeline = crate::screenshot_impl::screenshot_pipeline_permit().await?;
+                if let Some(window) = window_context.as_ref() {
+                    if let Some(capture) = self.hyprland_background_capture(window).await {
+                        let (raw, note) = capture?;
+                        screenshot_captured = Some(true);
+                        capture_note = note;
+                        return crate::screenshot_impl::run_image_task(move || {
+                            prepare_screenshot_payload(raw, screenshot_options)
+                        })
+                        .await;
+                    }
+                    // Refuse before capturing: the desktop must not be grabbed
+                    // only to be discarded.
+                    ensure_readonly_screenshot_target_is_visible(window)?;
+                } else if screenshot_target_requested {
+                    anyhow::bail!(
+                        "targeted screenshot requires a resolved window; refusing to return the full desktop"
+                    );
+                }
                 let raw = {
                     let _hold = self.indicator.hold_for_capture().await?;
                     capture_screenshot_raw().await
@@ -532,7 +551,6 @@ impl ComputerUseLinux {
                 let raw = raw?;
                 self.cache_desktop_size(raw.width, raw.height);
                 let crop = if let Some(window) = window_context.as_ref() {
-                    ensure_readonly_screenshot_target_is_visible(window)?;
                     Some(self.window_crop_rect_for_capture(window, &raw).await?)
                 } else {
                     None
@@ -679,6 +697,10 @@ impl ComputerUseLinux {
         } else if let Some(error) = &window_error {
             message.push_str(&format!(" Window target resolution failed: {error}"));
         }
+        if let Some(note) = capture_note {
+            message.push(' ');
+            message.push_str(&note);
+        }
         if let Some(warning) = unscoped_accessibility_tree_warning(
             tree_scoped,
             accessibility_error.is_none(),
@@ -765,9 +787,65 @@ impl ComputerUseLinux {
         result
     }
 
+    /// Background mode for the screenshot tool: an unfocused Hyprland target is
+    /// captured with `grim -T` and never raised.
+    async fn hyprland_background_screenshot(
+        &self,
+        target: &WindowTarget,
+        params: &ScreenshotParams,
+    ) -> Option<Result<CallToolResult>> {
+        if !crate::hyprland_input::background_enabled() {
+            return None;
+        }
+        let windows = list_windows().await.ok()?;
+        let window = resolve_window_target(&windows, target).ok()?.clone();
+        let (raw, note) = match self.hyprland_background_capture(&window).await? {
+            Ok(capture) => capture,
+            Err(error) => return Some(Err(error.context("targeted screenshot failed"))),
+        };
+        let options = params.screenshot_options();
+        let capture = match crate::screenshot_impl::run_image_task(move || {
+            prepare_screenshot_payload(raw, options)
+        })
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) => return Some(Err(error.context("screenshot resize failed"))),
+        };
+        let mut caption = serde_json::json!({
+            "width": capture.width,
+            "height": capture.height,
+            "coordinate_width": capture.coordinate_width,
+            "coordinate_height": capture.coordinate_height,
+            "scale": capture.scale,
+            "resized": capture.resized,
+            "bytes": capture.bytes,
+            "original_bytes": capture.original_bytes,
+            "max_bytes": capture.max_bytes,
+            "format": capture.format,
+            "quality": capture.quality,
+            "source": capture.source,
+            "cropped_to_window": true,
+            "window_title": window.title,
+            "window_raised": false,
+        });
+        if let Some(note) = note {
+            caption["hidden_workspace_note"] = serde_json::json!(note);
+        }
+        Some(Ok(CallToolResult::success(vec![
+            ContentBlock::image(data_url_payload(&capture.data_url), capture.mime_type),
+            ContentBlock::text(caption.to_string()),
+        ])))
+    }
+
     async fn capture_screenshot(&self, params: ScreenshotParams) -> Result<CallToolResult> {
         let _pipeline = crate::screenshot_impl::screenshot_pipeline_permit().await?;
         let target = params.window_target();
+        if let (Some(target), false) = (target.as_ref(), params.full_screen.unwrap_or(false)) {
+            if let Some(result) = self.hyprland_background_screenshot(target, &params).await {
+                return result;
+            }
+        }
         let target_window = match target.as_ref() {
             Some(target) => Some(
                 self.resolve_screenshot_window(target, params.raise_window.unwrap_or(true))
@@ -5199,8 +5277,54 @@ impl ComputerUseLinux {
         candidates.into_iter().next()
     }
 
+    /// Hyprland background capture: when opted in with
+    /// `COMPUTER_USE_LINUX_HYPRLAND_BACKGROUND=1` and the target is an
+    /// unfocused Hyprland window, capture just that window with `grim -T`
+    /// instead of raising it or grabbing the desktop through the portal.
+    /// Returns `None` to fall through to the regular capture path. The note
+    /// explains the repaint capture used for windows on hidden workspaces.
+    async fn hyprland_background_capture(
+        &self,
+        window: &WindowInfo,
+    ) -> Option<Result<(RawScreenshotCapture, Option<String>)>> {
+        if !crate::hyprland_input::background_enabled()
+            || window.backend != registry::HYPRLAND_BACKEND
+            || window.focused
+        {
+            return None;
+        }
+        Some(
+            async {
+                let capture =
+                    crate::windowing::backends::hyprland::capture_window(window.window_id).await?;
+                let note = capture.repainted.then(|| {
+                    format!(
+                        "Window_id {} is on hidden workspace {}, which Hyprland does not repaint. It was captured twice so the window drew a current frame; animations or slow loads may still lag the accessibility tree, which stays authoritative.",
+                        window.window_id,
+                        window.workspace.map_or("?".to_string(), |id| id.to_string())
+                    )
+                });
+                Ok((
+                    RawScreenshotCapture {
+                        mime_type: "image/png".to_string(),
+                        bytes: capture.png,
+                        source: if capture.repainted {
+                            "hyprland-grim-toplevel (hidden workspace, repainted)".to_string()
+                        } else {
+                            "hyprland-grim-toplevel".to_string()
+                        },
+                        width: capture.width,
+                        height: capture.height,
+                    },
+                    note,
+                ))
+            }
+            .await,
+        )
+    }
+
     /// Hyprland background input: when opted in with
-    /// `COMPUTER_USE_LINUX_HYPRLAND_BACKGROUND_INPUT=1` and the call names a
+    /// `COMPUTER_USE_LINUX_HYPRLAND_BACKGROUND=1` and the call names a
     /// target window, keys go to that window through `send_key_state` without
     /// focusing it, so the user's focus, cursor and workspace stay put.
     /// Returns `None` to fall through to the focus-then-type path.
@@ -5211,7 +5335,7 @@ impl ComputerUseLinux {
         presses: std::result::Result<Vec<crate::hyprland_input::KeyPress>, String>,
         received: Option<serde_json::Value>,
     ) -> Option<ActionOutput> {
-        if !crate::hyprland_input::background_input_enabled()
+        if !crate::hyprland_input::background_enabled()
             || !target.has_target()
             || !env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| {
                 desktop
